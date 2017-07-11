@@ -19,6 +19,7 @@ package metricsutil
 import (
 	"fmt"
 	"io"
+	"sort"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/kubernetes/pkg/api"
@@ -51,7 +52,96 @@ func NewTopCmdPrinter(out io.Writer) *TopCmdPrinter {
 	return &TopCmdPrinter{out: out}
 }
 
-func (printer *TopCmdPrinter) PrintNodeMetrics(metrics []metricsapi.NodeMetrics, availableResources map[string]api.ResourceList) error {
+type containerMetrics struct {
+	name    string
+	pod     *metricsapi.PodMetrics
+	metrics api.ResourceList
+}
+
+type containerMetricsSort struct {
+	metrics  []containerMetrics
+	sortType string
+}
+
+func (m containerMetricsSort) Len() int {
+	return len(m.metrics)
+}
+
+func (m containerMetricsSort) Swap(i, j int) {
+	m.metrics[i], m.metrics[j] = m.metrics[j], m.metrics[i]
+}
+
+func (m containerMetricsSort) Less(i, j int) bool {
+	switch m.sortType {
+	case "name":
+		return m.metrics[i].pod.Name < m.metrics[j].pod.Name
+	case "cpu":
+		return m.metrics[i].metrics.Cpu().MilliValue() < m.metrics[j].metrics.Cpu().MilliValue()
+	case "memory":
+		return m.metrics[i].metrics.Memory().Value() < m.metrics[j].metrics.Memory().Value()
+	}
+	return false
+}
+
+type nodeMetricsSort struct {
+	metrics  []metricsapi.NodeMetrics
+	sortType string
+}
+
+func (m nodeMetricsSort) Len() int {
+	return len(m.metrics)
+}
+
+func (m nodeMetricsSort) Swap(i, j int) {
+	m.metrics[i], m.metrics[j] = m.metrics[j], m.metrics[i]
+}
+
+func (m nodeMetricsSort) Less(i, j int) bool {
+	switch m.sortType {
+	case "name":
+		return m.metrics[i].Name < m.metrics[j].Name
+	case "cpu":
+		return m.metrics[i].Usage.Cpu().MilliValue() < m.metrics[j].Usage.Cpu().MilliValue()
+	case "memory":
+		return m.metrics[i].Usage.Memory().Value() < m.metrics[j].Usage.Memory().Value()
+	}
+	return false
+}
+
+type podMetricsSort struct {
+	metrics     []metricsapi.PodMetrics
+	fullMetrics []api.ResourceList
+	sortType    string
+}
+
+func (m podMetricsSort) Len() int {
+	return len(m.metrics)
+}
+
+func (m podMetricsSort) Swap(i, j int) {
+	m.metrics[i], m.metrics[j] = m.metrics[j], m.metrics[i]
+	m.fullMetrics[i], m.fullMetrics[j] = m.fullMetrics[j], m.fullMetrics[i]
+}
+
+func (m podMetricsSort) Less(i, j int) bool {
+	switch m.sortType {
+	case "name":
+		return m.metrics[i].Name < m.metrics[j].Name
+	case "cpu":
+		return m.fullMetrics[i].Cpu().MilliValue() < m.fullMetrics[j].Cpu().MilliValue()
+	case "memory":
+		return m.fullMetrics[i].Memory().Value() < m.fullMetrics[j].Memory().Value()
+	default:
+		return false
+	}
+	return false
+}
+
+func (printer *TopCmdPrinter) PrintNodeMetrics(metrics []metricsapi.NodeMetrics, availableResources map[string]api.ResourceList, sorting string) error {
+	if len(sorting) > 0 {
+		sort.Sort(nodeMetricsSort{metrics, sorting})
+	}
+
 	if len(metrics) == 0 {
 		return nil
 	}
@@ -74,7 +164,7 @@ func (printer *TopCmdPrinter) PrintNodeMetrics(metrics []metricsapi.NodeMetrics,
 	return nil
 }
 
-func (printer *TopCmdPrinter) PrintPodMetrics(metrics []metricsapi.PodMetrics, printContainers bool, withNamespace bool) error {
+func (printer *TopCmdPrinter) PrintPodMetrics(metrics []metricsapi.PodMetrics, printContainers bool, withNamespace bool, sorting string) error {
 	if len(metrics) == 0 {
 		return nil
 	}
@@ -88,11 +178,60 @@ func (printer *TopCmdPrinter) PrintPodMetrics(metrics []metricsapi.PodMetrics, p
 		printValue(w, PodColumn)
 	}
 	printColumnNames(w, PodColumns)
-	for _, m := range metrics {
-		err := printSinglePodMetrics(w, &m, printContainers, withNamespace)
-		if err != nil {
-			return err
+
+	allContainers := make([]containerMetrics, 0)
+	pods := make([]api.ResourceList, 0)
+	for i, m := range metrics {
+		podMetrics := make(api.ResourceList)
+		containers := make(map[string]api.ResourceList)
+		for _, res := range MeasuredResources {
+			podMetrics[res], _ = resource.ParseQuantity("0")
 		}
+		for _, c := range m.Containers {
+			var usage api.ResourceList
+			err := api.Scheme.Convert(&c.Usage, &usage, nil)
+			if err != nil {
+				return err
+			}
+			containers[c.Name] = usage
+			allContainers = append(allContainers, containerMetrics{c.Name, &metrics[i], usage})
+			if !printContainers {
+				for _, res := range MeasuredResources {
+					quantity := podMetrics[res]
+					quantity.Add(usage[res])
+					podMetrics[res] = quantity
+				}
+			}
+		}
+		pods = append(pods, podMetrics)
+	}
+
+	if !printContainers {
+		sort.Sort(podMetricsSort{metrics, pods, sorting})
+		for _, m := range metrics {
+			err := printSinglePodMetrics(w, &m, printContainers, withNamespace)
+			if err != nil {
+				return err
+			}
+		}
+	} else {
+		sort.Sort(containerMetricsSort{allContainers, sorting})
+		printAllContainers(w, allContainers, withNamespace)
+	}
+	return nil
+}
+
+func printAllContainers(out io.Writer, containers []containerMetrics, withNamespace bool) error {
+	for _, c := range containers {
+		if withNamespace {
+			printValue(out, c.pod.Namespace)
+		}
+		printValue(out, c.pod.Name)
+		printMetricsLine(out, &ResourceMetricsInfo{
+			Name:      c.name,
+			Metrics:   c.metrics,
+			Available: api.ResourceList{},
+		})
 	}
 	return nil
 }
