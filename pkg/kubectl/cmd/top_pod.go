@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -39,6 +39,7 @@ type TopPodOptions struct {
 	ResourceName    string
 	Namespace       string
 	Selector        string
+	Sort            string
 	AllNamespaces   bool
 	PrintContainers bool
 	PodClient       coreclient.PodsGetter
@@ -84,6 +85,11 @@ func NewCmdTopPod(f cmdutil.Factory, out io.Writer) *cobra.Command {
 			if err := options.Complete(f, cmd, args, out); err != nil {
 				cmdutil.CheckErr(err)
 			}
+			sorting, err := cmd.Flags().GetString("sort-by")
+			options.Sort = sorting
+			if err != nil {
+				cmdutil.CheckErr(err)
+			}
 			if err := options.Validate(); err != nil {
 				cmdutil.CheckErr(cmdutil.UsageErrorf(cmd, "%v", err))
 			}
@@ -96,6 +102,7 @@ func NewCmdTopPod(f cmdutil.Factory, out io.Writer) *cobra.Command {
 	cmd.Flags().StringVarP(&options.Selector, "selector", "l", "", "Selector (label query) to filter on, supports '=', '==', and '!='.")
 	cmd.Flags().BoolVar(&options.PrintContainers, "containers", false, "If present, print usage of containers within a pod.")
 	cmd.Flags().BoolVar(&options.AllNamespaces, "all-namespaces", false, "If present, list the requested object(s) across all namespaces. Namespace in current context is ignored even if specified with --namespace.")
+	cmd.Flags().String("sort-by", "", "If non-empty, sort list types using this field specification.  The field specification is expressed as a JSONPath expression (e.g. '{.metadata.name}'). The field in the API resource specified by this JSONPath expression must be an integer or a string.")
 	options.HeapsterOptions.Bind(cmd.Flags())
 	return cmd
 }
@@ -126,6 +133,9 @@ func (o *TopPodOptions) Validate() error {
 	if len(o.ResourceName) > 0 && len(o.Selector) > 0 {
 		return errors.New("only one of NAME or --selector can be provided")
 	}
+	if len(o.Sort) > 0 && o.Sort != "name" && o.Sort != "cpu" && o.Sort != "memory" {
+		return errors.New("Please select either name, cpu, or memory to sort by")
+	}
 	return nil
 }
 
@@ -152,7 +162,7 @@ func (o TopPodOptions) RunTopPod() error {
 	if err != nil {
 		return err
 	}
-	return o.Printer.PrintPodMetrics(metrics, o.PrintContainers, o.AllNamespaces)
+	return o.Printer.PrintPodMetrics(metrics, o.PrintContainers, o.AllNamespaces, o.Sort)
 }
 
 func verifyEmptyMetrics(o TopPodOptions, selector labels.Selector) error {
